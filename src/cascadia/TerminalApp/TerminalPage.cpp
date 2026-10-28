@@ -54,6 +54,36 @@ using namespace std::chrono_literals;
 
 #define HOOKUP_ACTION(action) _actionDispatch->action({ this, &TerminalPage::_Handle##action });
 
+// Method Description:
+// - Determines whether a pane request asked for elevation *explicitly*.
+// - A request is explicit when it names a profile (`-p <name|guid>`, a profile
+//   index from the new tab menu, or the dropdown) or when the action itself
+//   carries `"elevate": true`.
+// - A request that names neither just falls back to the default profile. Those
+//   are the implicit launches: a bare `wt.exe` (Win+X, Start, Explorer, the
+//   default terminal handoff), `+`, Ctrl+Shift+T, and tab duplication. Honoring
+//   a profile's `"elevate": true` for those means popping UAC for a launch the
+//   user never asked to elevate.
+// Arguments:
+// - newTerminalArgs: the args of the pane request. May be null.
+// Return Value:
+// - true if we should consider elevating this request at all.
+static bool _isExplicitElevationRequest(const NewTerminalArgs& newTerminalArgs)
+{
+    if (!newTerminalArgs)
+    {
+        return false;
+    }
+
+    if (!newTerminalArgs.Profile().empty() || newTerminalArgs.ProfileIndex())
+    {
+        return true;
+    }
+
+    const auto elevate = newTerminalArgs.Elevate();
+    return elevate && elevate.Value();
+}
+
 namespace winrt
 {
     namespace MUX = Microsoft::UI::Xaml;
@@ -514,6 +544,7 @@ namespace winrt::TerminalApp::implementation
         }
 
         // Check that there's at least one action that's not just an elevated newTab action.
+        bool anyPaneSpawningAction = false;
         for (const auto& action : _startupActions)
         {
             // Only new terminal panes will be requesting elevation.
@@ -552,6 +583,22 @@ namespace winrt::TerminalApp::implementation
                 continue;
             }
 
+            // We found an action that will spawn a pane, so this action decides
+            // whether the whole launch needs to be handed off.
+            anyPaneSpawningAction = true;
+
+            // Only honor "elevate" when the caller explicitly asked for either a
+            // profile or elevation. A bare `wt.exe` (Win+X, Start, the Explorer
+            // context menu, the default terminal handoff) names no profile at
+            // all and simply resolves to the default profile. If that profile -
+            // or the "defaults" block - sets "elevate": true, honoring it here
+            // means we pop a UAC prompt for a launch the user never asked to
+            // elevate. Treat "nothing specified" as "not elevated".
+            if (!_isExplicitElevationRequest(newTerminalArgs))
+            {
+                return false;
+            }
+
             // It's possible that newTerminalArgs is null here.
             // GetProfileForArgs should be resilient to that.
             const auto profile{ settings.GetProfileForArgs(newTerminalArgs) };
@@ -564,7 +611,12 @@ namespace winrt::TerminalApp::implementation
             // We're going to open at least one tab, so return false.
             return false;
         }
-        return true;
+
+        // If none of the startup actions spawn a pane, there is nothing to hand
+        // off. HandoffToElevated() would dispatch zero actions, AppHost would
+        // skip window creation entirely, and the app would exit without ever
+        // showing a window.
+        return anyPaneSpawningAction;
     }
 
     // Method Description:
@@ -4971,6 +5023,22 @@ namespace winrt::TerminalApp::implementation
         // If we don't even want to elevate we can return early.
         // If we're already elevated we can also return, because it doesn't get any more elevated than that.
         if (!defaultSettings->Elevate() || IsRunningElevated())
+        {
+            return false;
+        }
+
+        // Only honor "elevate" when the caller explicitly asked for either a
+        // profile or elevation. `+`, Ctrl+Shift+T, the initial tab of a bare
+        // launch, and tab duplication all land here with nothing specified, so
+        // they just resolve to the default profile. If that profile (or the
+        // "defaults" block) sets "elevate": true, the old behavior was to
+        // silently throw a UAC prompt at the user for a pane they never asked to
+        // elevate - including when they launched an explicitly non-elevated
+        // Terminal from Win+X. Requiring an explicit request keeps the
+        // deliberate paths (`wt -p <profile>`, the profile dropdown, the new tab
+        // menu, `"elevate": true` on an action) working while making an implicit
+        // launch never elevate.
+        if (!_isExplicitElevationRequest(newTerminalArgs))
         {
             return false;
         }
